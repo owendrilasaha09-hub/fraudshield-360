@@ -1,22 +1,13 @@
-# Dependencies
 __pycache__/
 *.pyc
 .env
 .env.*
-
-# IDE
 .vscode/
 .idea/
 *.swp
-
-# OS
 .DS_Store
 Thumbs.db
 desktop.ini
-
-# Snowflake
 .snowflake/
 *.gz
-
-# Cortex Code
 .cortex/

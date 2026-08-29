@@ -45,7 +45,7 @@ def get_effective_roles(session):
         roles_df = session.sql("""
             SELECT ASSIGNED_ROLE
             FROM FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING
-            WHERE USER_NAME = CURRENT_USER()
+            WHERE UPPER(USER_NAME) = CURRENT_USER()
               AND STATUS = 'ACTIVE'
               AND (EXPIRES_AT IS NULL OR EXPIRES_AT > CURRENT_TIMESTAMP())
         """).to_pandas()
@@ -883,11 +883,12 @@ if screen == "Command Center":
     summary = session.sql("""
         SELECT
             COUNT(*) AS total,
-            COUNT(CASE WHEN RISK_TIER = 'CRITICAL' THEN 1 END) AS critical,
-            COUNT(CASE WHEN RISK_TIER = 'HIGH' THEN 1 END) AS high,
-            COUNT(CASE WHEN CASE_STATUS = 'OPEN' THEN 1 END) AS open_cases,
-            COUNT(CASE WHEN CASE_STATUS = 'ESCALATED' THEN 1 END) AS escalated
-        FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS
+            COUNT(CASE WHEN COALESCE(te.RISK_TIER, fa.RISK_TIER) = 'CRITICAL' THEN 1 END) AS critical,
+            COUNT(CASE WHEN COALESCE(te.RISK_TIER, fa.RISK_TIER) = 'HIGH' THEN 1 END) AS high,
+            COUNT(CASE WHEN fa.CASE_STATUS = 'OPEN' THEN 1 END) AS open_cases,
+            COUNT(CASE WHEN fa.CASE_STATUS = 'ESCALATED' THEN 1 END) AS escalated
+        FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS fa
+        LEFT JOIN FRAUDSHIELD_360_DB.CURATED.TRANSACTION_ENRICHED te ON fa.TXN_ID = te.TXN_ID
     """).to_pandas().iloc[0]
 
     m1, m2, m3, m4, m5 = st.columns(5)
@@ -917,16 +918,17 @@ if screen == "Command Center":
             fa.CASE_ID,
             fa.ACCOUNT_ID,
             fa.ALERT_TYPE,
-            fa.RISK_TIER,
-            fa.RISK_SCORE,
+            COALESCE(te.RISK_TIER, fa.RISK_TIER) AS RISK_TIER,
+            COALESCE(te.RISK_SCORE, fa.RISK_SCORE) AS RISK_SCORE,
             fa.CASE_STATUS,
             fa.ASSIGNED_ANALYST,
             TO_VARCHAR(fa.ALERT_TIMESTAMP, 'YYYY-MM-DD HH24:MI:SS') AS ALERT_TIME,
             COALESCE(cve.RESPONSE_TYPE, 'NO_VERIFICATION') AS CUSTOMER_RESPONSE
         FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS fa
+        LEFT JOIN FRAUDSHIELD_360_DB.CURATED.TRANSACTION_ENRICHED te ON fa.TXN_ID = te.TXN_ID
         LEFT JOIN FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS cve
             ON fa.CASE_ID = cve.CASE_ID
-        WHERE fa.RISK_TIER IN ({tier_in})
+        WHERE COALESCE(te.RISK_TIER, fa.RISK_TIER) IN ({tier_in})
           AND fa.CASE_STATUS IN ({status_in})
         ORDER BY fa.ALERT_TIMESTAMP DESC
         LIMIT {row_limit}
@@ -975,9 +977,14 @@ elif screen == "Case Investigator":
     st.header("Case Investigator")
 
     cases_df = session.sql("""
-        SELECT CASE_ID, ACCOUNT_ID, RISK_TIER, ALERT_TYPE, RISK_SCORE, CASE_STATUS
-        FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS
-        ORDER BY ALERT_TIMESTAMP DESC LIMIT 50
+        SELECT fa.CASE_ID, fa.ACCOUNT_ID,
+               COALESCE(te.RISK_TIER, fa.RISK_TIER) AS RISK_TIER,
+               fa.ALERT_TYPE,
+               COALESCE(te.RISK_SCORE, fa.RISK_SCORE) AS RISK_SCORE,
+               fa.CASE_STATUS
+        FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS fa
+        LEFT JOIN FRAUDSHIELD_360_DB.CURATED.TRANSACTION_ENRICHED te ON fa.TXN_ID = te.TXN_ID
+        ORDER BY fa.ALERT_TIMESTAMP DESC LIMIT 50
     """).to_pandas()
 
     if cases_df.empty:
@@ -1827,18 +1834,28 @@ elif screen == "Audit Log":
 # =============================================================================
 elif screen == "Access Management":
     st.header("Access Management")
-    st.caption("User lifecycle, role assignment, maker-checker approval, and offboarding.")
+    st.caption("User lifecycle, role assignment, access history, and offboarding.")
 
-    # Roles that can be assigned from this UI (never the admin role itself)
-    ASSIGNABLE_ROLES = sorted(ALLOWED_ROLES - {'FRAUDSHIELD_ACCESS_ADMIN_ROLE'})
+    # All roles assignable from this UI — every grant is audit-logged
+    ASSIGNABLE_ROLES = sorted(ALLOWED_ROLES)
 
-    # Fetch account users once
+    # Fetch users: try SHOW USERS first, fall back to USER_ROLE_MAPPING
+    user_list = []
     try:
         users_df = session.sql("SHOW USERS").to_pandas()
         user_list = users_df["name"].tolist() if "name" in users_df.columns else []
     except Exception as e:
-        user_list = []
         print(f"[ACCESS_MGMT] SHOW USERS failed: {e}")
+    if not user_list:
+        try:
+            mapping_users = session.sql("""
+                SELECT DISTINCT UPPER(USER_NAME) AS USER_NAME
+                FROM FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING
+                ORDER BY USER_NAME
+            """).to_pandas()
+            user_list = mapping_users["USER_NAME"].tolist() if not mapping_users.empty else []
+        except Exception:
+            pass
 
     # Current user for self-target blocking
     cu_df = session.sql("SELECT CURRENT_USER() AS U").to_pandas()
@@ -1846,7 +1863,7 @@ elif screen == "Access Management":
 
     # ----- TABS -----
     tab_users, tab_add, tab_assign, tab_requests, tab_offboard = st.tabs([
-        "Users", "Add User", "Assign/Revoke Role", "Access Requests", "Offboard"
+        "Users", "Add User", "Assign/Revoke Role", "Access Log", "Offboard"
     ])
 
     # ===== TAB 1: USERS =====
@@ -1875,6 +1892,7 @@ elif screen == "Access Management":
         if add_submitted:
             try:
                 _validate_identifier(new_login)
+                new_login = new_login.upper()  # Normalize to uppercase for CURRENT_USER() matching
                 _validate_identifier(new_role)
                 if not new_email or "@" not in new_email:
                     raise ValueError("Invalid email address")
@@ -1885,15 +1903,18 @@ elif screen == "Access Management":
                 safe_display = new_display.replace("'", "''") if new_display else new_login
                 safe_email = new_email.replace("'", "''")
 
+                # Create user with warehouse + role
                 session.sql(f"""
                     CREATE USER IF NOT EXISTS "{new_login}"
-                    PASSWORD = 'ChangeMeNow1!'
+                    PASSWORD = 'FraudShield360!Welcome2026'
                     MUST_CHANGE_PASSWORD = TRUE
                     DEFAULT_ROLE = '{new_role}'
+                    DEFAULT_WAREHOUSE = 'COMPUTE_WH'
                     DISPLAY_NAME = '{safe_display}'
                     EMAIL = '{safe_email}'
                 """).collect()
                 session.sql(f'GRANT ROLE {new_role} TO USER "{new_login}"').collect()
+                session.sql(f'GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE {new_role}').collect()
                 session.sql("""
                     MERGE INTO FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING tgt
                     USING (SELECT ? AS UN, ? AS AR) src
@@ -1907,13 +1928,103 @@ elif screen == "Access Management":
                     (CASE_ID, ACTION_TAKEN, RESOLVED_BY, REVIEWER_NOTES)
                     VALUES ('SYSTEM', 'USER_CREATED', CURRENT_USER(), ?)
                 """, params=[f"Created user {new_login} with role {new_role}"]).collect()
-                st.success(f"User **{new_login}** created with role **{new_role}** (must change password on first login).")
+
+                # Send welcome email with credentials
+                acct_url = "https://app.snowflake.com"
+                welcome_msg = (
+                    f"Welcome to FraudShield 360!\n\n"
+                    f"Your account has been created.\n\n"
+                    f"Login Name: {new_login}\n"
+                    f"Temporary Password: FraudShield360!Welcome2026\n"
+                    f"Role: {new_role}\n\n"
+                    f"Login URL: {acct_url}\n"
+                    f"Organization: APLFNWV\n"
+                    f"Account: TV48944\n\n"
+                    f"You will be required to change your password on first login.\n"
+                    f"After login, open the FraudShield Command Center app from Streamlit.\n\n"
+                    f"— FraudShield 360 Admin"
+                )
+                email_sent = False
+                try:
+                    session.sql("""
+                        CALL SYSTEM$SEND_EMAIL(
+                            'FRAUDSHIELD_EMAIL_INT',
+                            ?,
+                            'FraudShield 360: Your Account Has Been Created',
+                            ?
+                        )
+                    """, params=[new_email, welcome_msg]).collect()
+                    email_sent = True
+                except Exception as email_err:
+                    print(f"[WELCOME_EMAIL_ERROR] {email_err}")
+
+                if email_sent:
+                    st.success(f"User **{new_login}** created. Welcome email sent to **{new_email}**.")
+                else:
+                    st.success(f"User **{new_login}** created with role **{new_role}**.")
+                    st.warning(f"Email to **{new_email}** failed — address is not in the notification integration's allowed list.")
+
+                    # Offer admin the option to add the email and retry
+                    st.session_state["_pending_welcome"] = {
+                        "email": new_email, "login": new_login, "role": new_role, "msg": welcome_msg
+                    }
             except ValueError as ve:
                 print(f"[ADD_USER_VALIDATION] {ve}")
                 st.error(f"Validation error: {str(ve)}")
             except Exception as e:
                 print(f"[ADD_USER_ERROR] {e}")
                 st.error(f"Failed to create user: {str(e)}")
+
+        # Pending welcome email — admin can approve adding the email and retry
+        pending = st.session_state.get("_pending_welcome")
+        if pending:
+            st.divider()
+            st.subheader("Pending Welcome Email")
+            st.markdown(
+                f"**{pending['email']}** is not in the notification integration's allowed recipients list. "
+                f"Approve below to add it and send the welcome email to **{pending['login']}**."
+            )
+            col_approve, col_skip = st.columns(2)
+            with col_approve:
+                if st.button("Add Email & Send Welcome", key="approve_email_send"):
+                    try:
+                        # Fetch current allowed list (column names may be upper or lower case in SiS)
+                        current_df = session.sql("DESCRIBE NOTIFICATION INTEGRATION FRAUDSHIELD_EMAIL_INT").to_pandas()
+                        current_df.columns = [c.upper() for c in current_df.columns]
+                        allowed_row = current_df[current_df["PROPERTY"] == "ALLOWED_RECIPIENTS"]
+                        current_list = allowed_row.iloc[0]["PROPERTY_VALUE"] if not allowed_row.empty else ""
+                        existing_emails = [e.strip() for e in current_list.split(",") if e.strip()]
+
+                        new_email_to_add = pending["email"]
+                        if new_email_to_add not in existing_emails:
+                            existing_emails.append(new_email_to_add)
+
+                        email_list_sql = ", ".join([f"'{e}'" for e in existing_emails])
+                        session.sql(f"""
+                            ALTER NOTIFICATION INTEGRATION FRAUDSHIELD_EMAIL_INT
+                            SET ALLOWED_RECIPIENTS = ({email_list_sql})
+                        """).collect()
+
+                        # Retry sending welcome email
+                        session.sql("""
+                            CALL SYSTEM$SEND_EMAIL(
+                                'FRAUDSHIELD_EMAIL_INT',
+                                ?,
+                                'FraudShield 360: Your Account Has Been Created',
+                                ?
+                            )
+                        """, params=[pending["email"], pending["msg"]]).collect()
+
+                        st.success(f"Email added to allowed list and welcome email sent to **{pending['email']}**.")
+                        st.session_state.pop("_pending_welcome", None)
+                        _rerun()
+                    except Exception as approve_err:
+                        print(f"[EMAIL_APPROVE_ERROR] {approve_err}")
+                        st.error(f"Failed: {str(approve_err)}")
+            with col_skip:
+                if st.button("Skip (Share Manually)", key="skip_email_send"):
+                    st.code(f"Login: {pending['login']}\nPassword: FraudShield360!Welcome2026\nAccount: APLFNWV-TV48944")
+                    st.session_state.pop("_pending_welcome", None)
 
     # ===== TAB 3: ASSIGN/REVOKE ROLE =====
     with tab_assign:
@@ -1935,26 +2046,13 @@ elif screen == "Access Management":
                 try:
                     _validate_identifier(target_user)
                     _validate_identifier(target_role)
-                    if target_role not in ALLOWED_ROLES or target_role == 'FRAUDSHIELD_ACCESS_ADMIN_ROLE':
-                        raise ValueError("Cannot assign admin role from app")
+                    if target_role not in ALLOWED_ROLES:
+                        raise ValueError("Invalid role")
                     if target_user == current_user_name:
                         st.error("You cannot modify your own role assignments.")
                         st.stop()
 
-                    if do_grant and target_role == "COMPLIANCE_OFFICER_ROLE":
-                        # Maker-checker: queue for approval
-                        session.sql("""
-                            INSERT INTO FRAUDSHIELD_360_DB.AGENTS.ACCESS_REQUESTS
-                            (TARGET_USER, REQUESTED_ROLE, REQUESTED_BY, STATUS)
-                            VALUES (?, ?, CURRENT_USER(), 'PENDING')
-                        """, params=[target_user, target_role]).collect()
-                        session.sql("""
-                            INSERT INTO FRAUDSHIELD_360_DB.AGENTS.AGENT_AUDIT_LOG
-                            (CASE_ID, ACTION_TAKEN, RESOLVED_BY, REVIEWER_NOTES)
-                            VALUES ('SYSTEM', 'ACCESS_REQUEST_CREATED', CURRENT_USER(), ?)
-                        """, params=[f"Requested {target_role} for {target_user} - pending approval"]).collect()
-                        st.info(f"**COMPLIANCE_OFFICER_ROLE** requires maker-checker approval. Request submitted for **{target_user}**.")
-                    elif do_grant:
+                    if do_grant:
                         session.sql(f'GRANT ROLE {target_role} TO USER "{target_user}"').collect()
                         session.sql("""
                             MERGE INTO FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING tgt
@@ -1990,76 +2088,23 @@ elif screen == "Access Management":
                     print(f"[ASSIGN_REVOKE_ERROR] action={action} error={e}")
                     st.error("Operation failed. Check privileges and try again.")
 
-    # ===== TAB 4: ACCESS REQUESTS (Maker-Checker) =====
+    # ===== TAB 4: ACCESS LOG =====
     with tab_requests:
-        st.subheader("Pending Access Requests")
-        st.caption("COMPLIANCE_OFFICER_ROLE grants require a different admin to approve.")
-        pending_df = session.sql("""
-            SELECT REQUEST_ID, TARGET_USER, REQUESTED_ROLE, REQUESTED_BY, REQUESTED_AT
-            FROM FRAUDSHIELD_360_DB.AGENTS.ACCESS_REQUESTS
-            WHERE STATUS = 'PENDING'
-            ORDER BY REQUESTED_AT ASC
+        st.subheader("Access Change History")
+        st.caption("Audit trail of all role grants, revocations, and user lifecycle events.")
+        access_log_df = session.sql("""
+            SELECT EVENT_ID, ACTION_TAKEN, RESOLVED_BY AS PERFORMED_BY,
+                   RESOLVED_AT AS EVENT_TIME, REVIEWER_NOTES AS DETAILS
+            FROM FRAUDSHIELD_360_DB.AGENTS.AGENT_AUDIT_LOG
+            WHERE CASE_ID = 'SYSTEM'
+            ORDER BY RESOLVED_AT DESC
+            LIMIT 100
         """).to_pandas()
 
-        if pending_df.empty:
-            st.info("No pending access requests.")
+        if access_log_df.empty:
+            st.info("No access change events recorded yet.")
         else:
-            for idx, req in pending_df.iterrows():
-                with st.expander(f"{req['TARGET_USER']} -> {req['REQUESTED_ROLE']} (by {req['REQUESTED_BY']})"):
-                    st.write(f"**Requested At:** {req['REQUESTED_AT']}")
-                    if req["REQUESTED_BY"] == current_user_name:
-                        st.warning("You cannot approve your own request. Another admin must approve.")
-                    else:
-                        c1, c2 = st.columns(2)
-                        with c1:
-                            if st.button("Approve", key=f"appr_{req['REQUEST_ID']}"):
-                                try:
-                                    t_user = req["TARGET_USER"]
-                                    t_role = req["REQUESTED_ROLE"]
-                                    _validate_identifier(t_user)
-                                    _validate_identifier(t_role)
-                                    session.sql(f'GRANT ROLE {t_role} TO USER "{t_user}"').collect()
-                                    session.sql("""
-                                        MERGE INTO FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING tgt
-                                        USING (SELECT ? AS UN, ? AS AR) src
-                                        ON tgt.USER_NAME = src.UN AND tgt.ASSIGNED_ROLE = src.AR
-                                        WHEN MATCHED THEN UPDATE SET STATUS = 'ACTIVE', ASSIGNED_BY = CURRENT_USER(), ASSIGNED_AT = CURRENT_TIMESTAMP()
-                                        WHEN NOT MATCHED THEN INSERT (USER_NAME, ASSIGNED_ROLE, ASSIGNED_BY, STATUS)
-                                            VALUES (src.UN, src.AR, CURRENT_USER(), 'ACTIVE')
-                                    """, params=[t_user, t_role]).collect()
-                                    session.sql("""
-                                        UPDATE FRAUDSHIELD_360_DB.AGENTS.ACCESS_REQUESTS
-                                        SET STATUS = 'APPROVED', APPROVED_BY = CURRENT_USER(), APPROVED_AT = CURRENT_TIMESTAMP()
-                                        WHERE REQUEST_ID = ?
-                                    """, params=[req["REQUEST_ID"]]).collect()
-                                    session.sql("""
-                                        INSERT INTO FRAUDSHIELD_360_DB.AGENTS.AGENT_AUDIT_LOG
-                                        (CASE_ID, ACTION_TAKEN, RESOLVED_BY, REVIEWER_NOTES)
-                                        VALUES ('SYSTEM', 'ACCESS_REQUEST_APPROVED', CURRENT_USER(), ?)
-                                    """, params=[f"Approved {t_role} for {t_user}"]).collect()
-                                    st.success("Request approved.")
-                                    _rerun()
-                                except Exception as e:
-                                    print(f"[APPROVE_ERROR] {e}")
-                                    st.error("Approval failed.")
-                        with c2:
-                            if st.button("Deny", key=f"deny_{req['REQUEST_ID']}"):
-                                try:
-                                    session.sql("""
-                                        UPDATE FRAUDSHIELD_360_DB.AGENTS.ACCESS_REQUESTS
-                                        SET STATUS = 'DENIED', APPROVED_BY = CURRENT_USER(), APPROVED_AT = CURRENT_TIMESTAMP()
-                                        WHERE REQUEST_ID = ?
-                                    """, params=[req["REQUEST_ID"]]).collect()
-                                    session.sql("""
-                                        INSERT INTO FRAUDSHIELD_360_DB.AGENTS.AGENT_AUDIT_LOG
-                                        (CASE_ID, ACTION_TAKEN, RESOLVED_BY, REVIEWER_NOTES)
-                                        VALUES ('SYSTEM', 'ACCESS_REQUEST_DENIED', CURRENT_USER(), ?)
-                                    """, params=[f"Denied {req['REQUESTED_ROLE']} for {req['TARGET_USER']}"]).collect()
-                                    st.warning("Request denied.")
-                                    _rerun()
-                                except Exception as e:
-                                    print(f"[DENY_ERROR] {e}")
-                                    st.error("Denial failed.")
+            st.dataframe(access_log_df, use_container_width=True)
 
     # ===== TAB 5: OFFBOARD =====
     with tab_offboard:
