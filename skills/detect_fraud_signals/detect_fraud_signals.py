@@ -1,9 +1,22 @@
 import json
+import re
 import _snowflake
 
 # Parameters passed by the agent
 account_id = account_id  # noqa: F841 - injected by skill runtime
 timeframe_hours = timeframe_hours if 'timeframe_hours' in dir() else 24  # noqa: F841
+
+# --- Input validation ---
+if not isinstance(account_id, str) or not re.match(r'^ACC-\d{1,15}$', account_id):
+    print(json.dumps({"error": "Invalid account_id format. Expected ACC-XXXXXXXXX."}))
+    raise SystemExit(0)
+try:
+    timeframe_hours = int(timeframe_hours)
+    if timeframe_hours < 1 or timeframe_hours > 8760:
+        raise ValueError
+except (ValueError, TypeError):
+    print(json.dumps({"error": "Invalid timeframe_hours. Must be integer 1-8760."}))
+    raise SystemExit(0)
 
 query = f"""
 WITH txn_window AS (

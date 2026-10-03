@@ -4,7 +4,7 @@
 fraudshield_orchestrator
 
 ## description
-Central routing orchestrator for the FraudShield 360 agent. Classifies user intent into one of four categories and returns a routing decision indicating which downstream skill should be invoked next. Acts as the front-door dispatcher for all fraud, regulatory, reporting, and verification queries.
+Central routing orchestrator for the FraudShield 360 agent. Classifies user intent into one or more categories and returns routing decisions indicating which downstream skills should be invoked. Supports compound queries that span multiple intents (e.g., "check fraud signals and generate a SAR report"). Acts as the front-door dispatcher for all fraud, regulatory, reporting, and verification queries.
 
 ## instructions
 
@@ -50,6 +50,18 @@ Classify `intent_text` into exactly one of:
 }
 ```
 
-### Script
+### Execution
 
-Execute the file `fraudshield_orchestrator.py` located in this skill folder.
+Classify the user's intent by analyzing the keywords in intent_text. You do NOT need to run a script — perform the classification directly based on these rules:
+
+1. Count keyword matches for each category:
+   - **fraud-query**: fraud, suspicious, risk, signal, velocity, anomaly, flagged, detect, risk score, risk tier
+   - **regulation-query**: regulation, regulatory, policy, compliance, aml, kyc, bsa, fatf, jurisdiction, legal, sanctions, ofac
+   - **report-request**: report, sar, audit, finding, evidence, filing, investigation, summary, generate report
+   - **verification-status-query**: verification, verified, confirm, customer response, timeout, dispatch, alert sent, pending response
+
+2. The category with the most matches wins. If confidence is low, use your own judgment.
+
+3. Return a JSON routing decision and then immediately invoke the routed skill.
+
+4. For compound queries (keywords match multiple categories), identify all matching intents and invoke each relevant skill sequentially.

@@ -55,6 +55,21 @@ If the confidence_score returned by the search service is below 0.70, the skill 
 }
 ```
 
-### Script
+### Execution
 
-Execute the file `query_regulatory_docs.py` located in this skill folder.
+Run the following SQL query using the `sql_execute` tool, replacing `{question}` (escape single quotes) and `{jurisdiction}`:
+
+```sql
+SELECT chunk_text, source_document, page_number, SCORE AS confidence_score
+FROM TABLE(
+    FRAUDSHIELD_360_DB.DOCUMENTS.REGULATORY_SEARCH_SVC!SEARCH(
+        QUERY => '{question}',
+        COLUMNS => ['chunk_text', 'source_document', 'page_number'],
+        LIMIT => 3
+    )
+)
+ORDER BY confidence_score DESC
+LIMIT 1
+```
+
+If the confidence_score >= 0.70, synthesize an answer from the chunk_text. If below 0.70 or no results, respond with: "Insufficient evidence in policy documents."

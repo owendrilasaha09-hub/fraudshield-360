@@ -202,11 +202,11 @@ def insert_transaction(txn_id, account_id, amount, merchant, country, channel) -
     )
 
 
-def create_alert_and_verification(account_id, txn_id, explanation):
+def create_alert_and_verification(account_id, txn_id, explanation, risk_score=75, risk_tier='CRITICAL'):
     """Atomically create fraud alert + verification event. Returns (case_id, event_id, token)."""
     case_id  = str(uuid.uuid4())
     event_id = str(uuid.uuid4())
-    token    = uuid.uuid4().hex  # single-use secret, distinct from EVENT_ID
+    token    = uuid.uuid4().hex
 
     try:
         exec_sql("BEGIN")
@@ -215,9 +215,9 @@ def create_alert_and_verification(account_id, txn_id, explanation):
             INSERT INTO {AGENTS}.FRAUD_ALERTS
                 (CASE_ID, ACCOUNT_ID, TXN_ID, ALERT_TIMESTAMP, ALERT_TYPE,
                  RISK_SCORE, RISK_TIER, CASE_STATUS)
-            VALUES (?, ?, ?, CURRENT_TIMESTAMP(), 'SIMULATOR_ALERT', 75, 'CRITICAL', 'OPEN')
+            VALUES (?, ?, ?, CURRENT_TIMESTAMP(), 'SIMULATOR_ALERT', ?, ?, 'OPEN')
             """,
-            [case_id, account_id, txn_id],
+            [case_id, account_id, txn_id, risk_score, risk_tier],
         )
         exec_sql(
             f"""
@@ -297,6 +297,76 @@ def send_email(recipient: str, subject: str, html_body: str) -> None:
         "CALL SYSTEM$SEND_EMAIL(?, ?, ?, ?, 'text/html')",
         [EMAIL_INTEGRATION, recipient, subject, html_body],
     )
+
+
+def compute_risk_score(account_id: str, amount: float, merchant: str, country: str) -> tuple:
+    """Mirror TRANSACTION_ENRICHED 6-signal scoring logic. Returns (score, tier, signals)."""
+    signals = {}
+    score = 0
+
+    # Signal: structuring ($9000-$9999)
+    signals['structuring'] = 9000 <= amount <= 9999
+    if signals['structuring']:
+        score += 20
+
+    # Signal: round number (mod 1000 = 0 and >= 1000)
+    signals['round_number'] = amount >= 1000 and amount % 1000 == 0
+    if signals['round_number']:
+        score += 5
+
+    # Signal: geo mismatch (country != account domicile)
+    domicile_df = q(
+        f"SELECT DOMICILE_COUNTRY FROM {RAW}.RAW_ACCOUNTS WHERE ACCOUNT_ID = ?",
+        [account_id],
+    )
+    domicile = domicile_df.iloc[0]['DOMICILE_COUNTRY'] if not domicile_df.empty and pd.notna(domicile_df.iloc[0]['DOMICILE_COUNTRY']) else country
+    signals['geo_mismatch'] = country != domicile
+    if signals['geo_mismatch']:
+        score += 20
+
+    # Signal: velocity (>3 txns in last hour for this account)
+    vel_df = q(
+        f"""SELECT COUNT(*) AS cnt FROM {RAW}.RAW_TRANSACTIONS
+            WHERE ACCOUNT_ID = ? AND TXN_TIMESTAMP >= DATEADD(HOUR, -1, CURRENT_TIMESTAMP())""",
+        [account_id],
+    )
+    signals['velocity'] = int(vel_df.iloc[0]['CNT']) > 3 if not vel_df.empty else False
+    if signals['velocity']:
+        score += 15
+
+    # Signal: amount anomaly (>5x median for this account)
+    med_df = q(
+        f"SELECT MEDIAN(AMOUNT) AS med FROM {RAW}.RAW_TRANSACTIONS WHERE ACCOUNT_ID = ?",
+        [account_id],
+    )
+    median_amt = float(med_df.iloc[0]['MED']) if not med_df.empty and pd.notna(med_df.iloc[0]['MED']) else amount
+    signals['amount_anomaly'] = amount > 5 * median_amt if median_amt > 0 else False
+    if signals['amount_anomaly']:
+        score += 25
+
+    # Signal: watchlist match (merchant matches a watchlist entity)
+    safe_merchant = merchant.replace("'", "''")[:255]
+    wl_df = q(
+        f"""SELECT 1 AS hit FROM {RAW}.RAW_WATCHLIST
+            WHERE CONTAINS(UPPER('{safe_merchant}'), UPPER(SPLIT_PART(ENTITY_NAME, ' ', 1)))
+            AND LENGTH(SPLIT_PART(ENTITY_NAME, ' ', 1)) > 3
+            LIMIT 1""",
+    )
+    signals['watchlist_match'] = not wl_df.empty
+    if signals['watchlist_match']:
+        score += 30
+
+    score = min(100, score)
+    if score >= 75:
+        tier = 'CRITICAL'
+    elif score >= 50:
+        tier = 'HIGH'
+    elif score >= 25:
+        tier = 'MEDIUM'
+    else:
+        tier = 'LOW'
+
+    return score, tier, signals
 
 
 # =============================================================================
@@ -509,17 +579,29 @@ with tab2:
             st.error(f"Transaction failed: {e}")
             st.stop()
 
-        if not will_flag:
-            st.info("✅ Transaction processed. No fraud signals triggered.")
+        # Compute real risk score mirroring TRANSACTION_ENRICHED logic
+        risk_score, risk_tier, signals = compute_risk_score(
+            account_id, amount, merchant.strip(), country
+        )
+
+        fired = [k for k, v in signals.items() if v]
+        st.caption(
+            f"Risk score: **{risk_score}**/100 · Tier: **{risk_tier}** · "
+            f"Signals: {', '.join(fired) if fired else 'none'}"
+        )
+
+        if risk_tier in ('LOW', 'MEDIUM'):
+            st.info(f"{'Transaction processed. No fraud signals triggered.' if risk_tier == 'LOW' else 'Minor risk flag. No verification required.'}")
         else:
-            st.warning("⚠️ High-risk transaction detected. Dispatching verification…")
+            st.warning(f"⚠️ {risk_tier}-risk transaction detected (score {risk_score}). Dispatching verification…")
             explanation = (
                 f"We noticed an unusual transaction of ${amount:,.2f} to "
                 f"{merchant.strip()} in {country}. Please confirm this was you."
             )
             try:
                 case_id, event_id, token = create_alert_and_verification(
-                    account_id, txn_id, explanation
+                    account_id, txn_id, explanation,
+                    risk_score=risk_score, risk_tier=risk_tier,
                 )
                 st.success(f"Verification case created · `{case_id[:8]}…`")
             except SnowparkSQLException as e:

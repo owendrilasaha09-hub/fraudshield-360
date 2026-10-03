@@ -6,6 +6,16 @@ import _snowflake
 intent_text = intent_text  # noqa: F841
 case_id = case_id if 'case_id' in dir() and case_id else None  # noqa: F841
 
+# --- Input validation ---
+if not isinstance(intent_text, str) or len(intent_text.strip()) == 0:
+    print(json.dumps({"error": "intent_text is required"}))
+    raise SystemExit(0)
+intent_text = intent_text[:1000]
+
+if case_id is not None:
+    if not isinstance(case_id, str) or not re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', case_id):
+        case_id = None
+
 # Intent classification via keyword/pattern scoring
 intent_text_lower = intent_text.lower() if intent_text else ""
 
@@ -144,12 +154,26 @@ if requires_clarification:
         "(4) checking a customer verification status?"
     )
 
+# Detect compound intents (multiple categories with significant scores)
+compound_intents = []
+for intent_key, config in INTENT_PATTERNS.items():
+    if config["weight"] > 0:
+        compound_intents.append({
+            "intent": intent_key,
+            "skill": config["skill"],
+            "weight": config["weight"]
+        })
+compound_intents.sort(key=lambda x: x["weight"], reverse=True)
+is_compound = len(compound_intents) > 1
+
 # Build reasoning
 reasoning_parts = []
 if INTENT_PATTERNS[best_intent]["weight"] > 0:
     matched_kws = [kw for kw in INTENT_PATTERNS[best_intent]["keywords"] if kw in intent_text_lower]
     reasoning_parts.append(f"Matched keywords: {', '.join(matched_kws[:5])}")
 reasoning_parts.append(f"Classification confidence: {confidence}")
+if is_compound:
+    reasoning_parts.append(f"Compound query detected: {len(compound_intents)} intents identified")
 reasoning = ". ".join(reasoning_parts)
 
 output = {
@@ -159,6 +183,8 @@ output = {
     "skill_parameters": skill_parameters,
     "requires_clarification": requires_clarification,
     "clarification_prompt": clarification_prompt,
+    "is_compound": is_compound,
+    "compound_intents": compound_intents if is_compound else None,
     "reasoning": reasoning
 }
 

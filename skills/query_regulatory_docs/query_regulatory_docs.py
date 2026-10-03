@@ -1,9 +1,19 @@
 import json
+import re
 import _snowflake
 
 # Parameters injected by the skill runtime
 question = question  # noqa: F841
 jurisdiction = jurisdiction if 'jurisdiction' in dir() else 'ALL'  # noqa: F841
+
+# --- Input validation ---
+if not isinstance(question, str) or len(question.strip()) == 0:
+    print(json.dumps({"error": "question is required"}))
+    raise SystemExit(0)
+question = question[:1000]
+
+if not isinstance(jurisdiction, str) or not re.match(r'^[A-Za-z]{1,10}$', jurisdiction):
+    jurisdiction = 'ALL'
 
 # Query the Cortex Search Service
 search_query = f"""

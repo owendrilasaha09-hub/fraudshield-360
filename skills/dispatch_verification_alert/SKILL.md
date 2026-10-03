@@ -4,39 +4,39 @@
 dispatch_verification_alert
 
 ## description
-Dispatches a customer verification alert for a flagged transaction. Generates a 256-bit entropy JWT token, inserts a new verification event record, and confirms dispatch via JSON payload. Used when the fraud detection system needs to prompt a customer to confirm or deny a suspicious transaction.
+Dispatches a customer verification alert for a flagged transaction, or checks the status of an existing verification. In dispatch mode, generates a 256-bit entropy JWT token, inserts a new verification event record, and confirms dispatch via JSON payload. In status_check mode, queries existing verification events for a case and returns the current status.
 
 ## instructions
 
-You are a verification dispatch skill. When invoked, execute the `dispatch_verification_alert.py` script to send a verification alert to the customer and record the event.
+You are a verification dispatch skill. When invoked, execute the `dispatch_verification_alert.py` script to either dispatch a new verification alert or check the status of an existing one.
 
 ### Parameters
 
+- **mode** (VARCHAR, optional, default: "dispatch"): Either "dispatch" to send a new alert, or "status_check" to query existing verification status.
+
+#### Dispatch mode parameters (mode = "dispatch"):
 - **txn_id** (VARCHAR, required): The transaction ID that triggered the alert.
 - **account_id** (VARCHAR, required): The account ID of the customer to alert.
 - **alert_id** (VARCHAR, required): The fraud alert/case ID associated with this dispatch.
 - **explanation_customer** (TEXT, required): The plain-language explanation to include in the customer notification.
 
-### Behavior
+#### Status check mode parameters (mode = "status_check"):
+- **case_id** (VARCHAR, required): The fraud case ID to check verification status for.
+
+### Behavior — Dispatch Mode
 
 1. Generate a cryptographically secure 256-bit entropy token (simulated JWT).
 2. Create a new EVENT_ID (UUID).
-3. Insert a new record into `FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS` with:
-   - EVENT_ID: newly generated UUID
-   - CASE_ID: the alert_id parameter
-   - ACCOUNT_ID: the account_id parameter
-   - TXN_ID: the txn_id parameter
-   - VERIFICATION_METHOD: 'MULTI_CHANNEL' (both email and push)
-   - RESPONSE_TYPE: 'AWAITING_RESPONSE'
-   - ALERT_DISPATCHED_AT: CURRENT_TIMESTAMP()
-   - EMAIL_STATUS: 'SENT'
-   - PUSH_STATUS: 'SENT'
-   - TOKEN_VALID: TRUE
-   - TOKEN_HASH: SHA-256 hash of the generated token
-   - EXPLANATION_CUSTOMER: the explanation text
+3. Insert a new record into `FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS`.
 4. Return a JSON payload confirming success.
 
-### Output Schema (JSON)
+### Behavior — Status Check Mode
+
+1. Query `FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS` for events matching the case_id.
+2. Return the most recent verification event's status, method, timestamps, and channel statuses.
+3. If no events exist, return a "no verification found" response.
+
+### Output Schema — Dispatch Mode (JSON)
 
 ```json
 {
@@ -54,9 +54,31 @@ You are a verification dispatch skill. When invoked, execute the `dispatch_verif
 }
 ```
 
+### Output Schema — Status Check Mode (JSON)
+
+```json
+{
+  "status": "SUCCESS",
+  "mode": "status_check",
+  "case_id": "<case_id>",
+  "total_events": <integer>,
+  "latest_event": {
+    "event_id": "<UUID>",
+    "response_type": "<AWAITING_RESPONSE|USER_CONFIRMED|USER_REQUESTED_REVIEW|USER_REJECTED|VERIFICATION_TIMEOUT>",
+    "verification_method": "<method>",
+    "dispatched_at": "<timestamp>",
+    "response_timestamp": "<timestamp or null>",
+    "response_time_minutes": <float or null>,
+    "email_status": "<status>",
+    "push_status": "<status>",
+    "token_valid": <boolean>
+  }
+}
+```
+
 ### Error Handling
 
-If the insert fails, return:
+If an operation fails, return:
 ```json
 {
   "status": "FAILED",
@@ -65,6 +87,30 @@ If the insert fails, return:
 }
 ```
 
-### Script
+### Execution
 
-Execute the file `dispatch_verification_alert.py` located in this skill folder.
+**Status Check Mode** — Run this SQL using the `sql_execute` tool:
+
+```sql
+SELECT EVENT_ID, RESPONSE_TYPE, VERIFICATION_METHOD,
+       ALERT_DISPATCHED_AT, RESPONSE_TIMESTAMP, RESPONSE_TIME_MINUTES,
+       EMAIL_STATUS, PUSH_STATUS, TOKEN_VALID
+FROM FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS
+WHERE CASE_ID = '{case_id}'
+ORDER BY ALERT_DISPATCHED_AT DESC
+```
+
+**Dispatch Mode** — This requires inserting a record. Only proceed if the user explicitly requests dispatching a verification alert. Run this SQL:
+
+```sql
+INSERT INTO FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS
+(EVENT_ID, CASE_ID, ACCOUNT_ID, TXN_ID, VERIFICATION_METHOD, RESPONSE_TYPE,
+ ALERT_DISPATCHED_AT, EMAIL_STATUS, PUSH_STATUS, TOKEN_VALID, TOKEN_HASH,
+ EXPLANATION_CUSTOMER)
+VALUES (
+    UUID_STRING(), '{alert_id}', '{account_id}', '{txn_id}',
+    'MULTI_CHANNEL', 'AWAITING_RESPONSE', CURRENT_TIMESTAMP(),
+    'SENT', 'SENT', TRUE, SHA2(UUID_STRING()),
+    '{explanation_customer}'
+)
+```

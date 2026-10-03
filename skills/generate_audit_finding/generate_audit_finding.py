@@ -1,9 +1,15 @@
 import json
+import re
 import _snowflake
 from datetime import datetime
 
 # Parameter injected by skill runtime
 case_id = case_id  # noqa: F841
+
+# --- Input validation ---
+if not isinstance(case_id, str) or not re.match(r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$', case_id):
+    print(f"ERROR: Invalid case_id format '{case_id}'. Expected UUID.")
+    raise SystemExit(0)
 
 # Fetch all data in a single joined query
 query = f"""
@@ -172,6 +178,53 @@ else:
         regulatory_notes.append("SAR filing recommended within 30 days per BSA requirements (31 CFR 1020.320)")
     if not regulatory_notes:
         regulatory_notes.append("No immediate regulatory filing triggered. Continue monitoring.")
+
+    # Ground regulatory section via Cortex Search Service
+    search_terms = []
+    if r.get('SIGNAL_STRUCTURING'):
+        search_terms.append("structuring threshold reporting requirements")
+    if r.get('SIGNAL_GEO_MISMATCH'):
+        search_terms.append("cross-border enhanced due diligence")
+    if r.get('SIGNAL_WATCHLIST_MATCH'):
+        search_terms.append("sanctions watchlist OFAC screening obligations")
+    if risk_tier in ('HIGH', 'CRITICAL'):
+        search_terms.append("suspicious activity report filing requirements")
+    if amount and amount >= 10000:
+        search_terms.append("currency transaction report threshold")
+
+    grounded_citations = []
+    if search_terms:
+        search_text = " ".join(search_terms).replace("'", "''")[:500]
+        try:
+            rag_query = f"""
+            SELECT chunk_text, source_document, page_number, SCORE AS confidence_score
+            FROM TABLE(
+                FRAUDSHIELD_360_DB.DOCUMENTS.REGULATORY_SEARCH_SVC!SEARCH(
+                    QUERY => '{search_text}',
+                    COLUMNS => ['chunk_text', 'source_document', 'page_number'],
+                    LIMIT => 3
+                )
+            )
+            ORDER BY confidence_score DESC
+            """
+            rag_results = _snowflake.execute_sql(rag_query)
+            if rag_results:
+                for rr in rag_results:
+                    score = float(rr.get('CONFIDENCE_SCORE', 0))
+                    if score >= 0.70:
+                        doc = rr.get('SOURCE_DOCUMENT', 'Unknown')
+                        page = rr.get('PAGE_NUMBER', '?')
+                        snippet = str(rr.get('CHUNK_TEXT', ''))[:200]
+                        grounded_citations.append(
+                            f"[Source: {doc}, p.{page}, confidence={score:.2f}] {snippet}"
+                        )
+        except Exception:
+            pass  # Fall back to hardcoded citations only
+
+    if grounded_citations:
+        regulatory_notes.append("")
+        regulatory_notes.append("--- Grounded Policy References ---")
+        regulatory_notes.extend(grounded_citations)
 
     # Recommended actions
     actions = []

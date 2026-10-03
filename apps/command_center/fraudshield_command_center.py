@@ -1,4 +1,5 @@
 import re as _re
+import json
 import base64 as _base64
 import html as _html
 import streamlit as st
@@ -1385,45 +1386,120 @@ elif screen == "CoCo Chat":
         st.session_state.chat_messages = []
 
     def coco_generate(user_text):
-        """Append the user's message, query Sentinel AI via Cortex, append the reply."""
+        """Append the user's message, invoke SENTINEL_AI_ENGINE agent, append the reply."""
         user_text = user_text.strip()
         if not user_text:
             return
         st.session_state.chat_messages.append({"role": "user", "content": user_text})
 
-        with st.spinner("CoCo is analyzing fraud signals..."):
+        with st.spinner("Sentinel AI is analyzing…"):
             try:
-                # Build context from recent alerts (no PII — only case/risk metadata)
-                context_df = session.sql("""
-                    SELECT TOP 5 CASE_ID, RISK_TIER, RISK_SCORE, ALERT_TYPE, CASE_STATUS
-                    FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS
-                    ORDER BY ALERT_TIMESTAMP DESC
-                """).to_pandas()
-                context_str = context_df.to_string(index=False) if not context_df.empty else "No recent alerts."
+                # Gather live fraud context from the database
+                context_parts = []
 
-                system_prompt = (
-                    "You are Sentinel AI, the FraudShield 360 fraud detection assistant. "
-                    "Answer questions about fraud alerts, transaction risk, AML compliance, and case investigations. "
-                    "Be concise and precise. Do not include or request any PII. "
-                    "Here is recent alert context:\n" + context_str
+                # Recent alerts
+                try:
+                    alerts_ctx = session.sql("""
+                        SELECT CASE_ID, ACCOUNT_ID, RISK_TIER, RISK_SCORE, ALERT_TYPE,
+                               CASE_STATUS, ALERT_TIMESTAMP
+                        FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS
+                        ORDER BY ALERT_TIMESTAMP DESC LIMIT 10
+                    """).to_pandas()
+                    if not alerts_ctx.empty:
+                        context_parts.append("RECENT FRAUD ALERTS: " + alerts_ctx.to_json(orient='records'))
+                    else:
+                        context_parts.append("RECENT FRAUD ALERTS: No alerts on record.")
+                except Exception:
+                    context_parts.append("RECENT FRAUD ALERTS: Unable to query.")
+
+                # Enriched transactions with risk
+                try:
+                    txn_ctx = session.sql("""
+                        SELECT ACCOUNT_ID, TXN_ID, AMOUNT, MERCHANT, GEO_COUNTRY,
+                               RISK_SCORE, RISK_TIER, SIGNAL_VELOCITY, SIGNAL_AMOUNT_ANOMALY,
+                               SIGNAL_GEO_MISMATCH, SIGNAL_WATCHLIST_MATCH,
+                               SIGNAL_STRUCTURING, SIGNAL_ROUND_NUMBER, TXN_TIMESTAMP
+                        FROM FRAUDSHIELD_360_DB.CURATED.TRANSACTION_ENRICHED
+                        WHERE RISK_SCORE > 0
+                        ORDER BY RISK_SCORE DESC LIMIT 10
+                    """).to_pandas()
+                    if not txn_ctx.empty:
+                        context_parts.append("HIGH-RISK TRANSACTIONS (from Dynamic Table): " + txn_ctx.to_json(orient='records'))
+                    else:
+                        context_parts.append("HIGH-RISK TRANSACTIONS: No flagged transactions in TRANSACTION_ENRICHED.")
+                except Exception:
+                    context_parts.append("HIGH-RISK TRANSACTIONS: Dynamic table empty or not yet refreshed.")
+
+                # Verification events
+                try:
+                    ver_ctx = session.sql("""
+                        SELECT CASE_ID, RESPONSE_TYPE, VERIFICATION_METHOD,
+                               ALERT_DISPATCHED_AT, RESPONSE_TIMESTAMP
+                        FROM FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS
+                        ORDER BY ALERT_DISPATCHED_AT DESC LIMIT 5
+                    """).to_pandas()
+                    if not ver_ctx.empty:
+                        context_parts.append("VERIFICATION EVENTS: " + ver_ctx.to_json(orient='records'))
+                except Exception:
+                    pass
+
+                live_context = " | ".join(context_parts)
+
+                # Build a single user message with context + conversation history + current question
+                history_text = ""
+                for msg in st.session_state.chat_messages[:-1]:  # all except the current one
+                    role_label = "User" if msg["role"] == "user" else "Assistant"
+                    history_text += f"{role_label}: {msg['content']}\n"
+
+                full_prompt = (
+                    "LIVE DATA FROM FRAUDSHIELD_360_DB:\n"
+                    + live_context + "\n\n"
                 )
+                if history_text:
+                    full_prompt += "CONVERSATION HISTORY:\n" + history_text + "\n"
+                full_prompt += "CURRENT QUESTION: " + user_text
 
-                # Pass user input as bind parameter to CORTEX.COMPLETE
+                request_body = json.dumps({
+                    "messages": [{
+                        "role": "user",
+                        "content": [{"type": "text", "text": full_prompt}]
+                    }]
+                })
+
                 result_df = session.sql("""
-                    SELECT SNOWFLAKE.CORTEX.COMPLETE(
-                        'claude-haiku-4-5',
-                        CONCAT(?, '\n\nUser question: ', ?, '\n\nAnswer:')
-                    ) AS response
-                """, params=[system_prompt, user_text]).to_pandas()
+                    SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN(
+                        'FRAUDSHIELD_360_DB.AGENTS.SENTINEL_AI_ENGINE',
+                        ?,
+                        TRUE
+                    ) AS RESP
+                """, params=[request_body]).to_pandas()
 
-                if not result_df.empty and result_df["RESPONSE"].iloc[0]:
-                    response_text = str(result_df["RESPONSE"].iloc[0]).strip()
+                # Robust response parsing: handle column name case + double-encoded JSON
+                result_df.columns = [c.upper() for c in result_df.columns]
+                resp_raw = result_df["RESP"].iloc[0] if not result_df.empty else None
+                if resp_raw is not None:
+                    resp_str = str(resp_raw)
+                    # DATA_AGENT_RUN returns a JSON string; parse it
+                    resp = json.loads(resp_str)
+                    # If still a string after first parse (double-encoded), parse again
+                    if isinstance(resp, str):
+                        resp = json.loads(resp)
+
+                    # Check for error response from agent API
+                    if "code" in resp and "message" in resp and "content" not in resp:
+                        response_text = f"Agent error: {resp.get('message', 'Unknown error')}"
+                    else:
+                        text_parts = [
+                            b["text"] for b in resp.get("content", [])
+                            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                        ]
+                        response_text = "\n\n".join(text_parts) if text_parts else "Agent returned empty response."
                 else:
                     response_text = "I could not generate a response. Please rephrase your question."
 
             except Exception as e:
                 print(f"[COCO_CHAT_ERROR] {e}")
-                response_text = "An error occurred while processing your request. Please try again."
+                response_text = f"Agent error: {str(e)[:300]}"
 
         st.session_state.chat_messages.append({"role": "assistant", "content": response_text})
 
@@ -1541,134 +1617,53 @@ elif screen == "Report Preview":
         report_case_id = report_cases.iloc[report_idx]["CASE_ID"]
 
         if st.button("\U0001F4C4  Generate SAR Report", type="primary"):
-            with st.spinner("Generating Suspicious Activity Report..."):
-                # Build report from data
-                report_data = session.sql("""
-                    SELECT fa.CASE_ID, fa.ACCOUNT_ID, fa.TXN_ID, fa.ALERT_TYPE,
-                           fa.RISK_SCORE, fa.RISK_TIER, fa.CASE_STATUS, fa.ASSIGNED_ANALYST,
-                           fa.ALERT_TIMESTAMP,
-                           te.AMOUNT, te.MERCHANT, te.GEO_COUNTRY, te.GEO_CITY,
-                           te.CHANNEL, te.TXN_TIMESTAMP, te.DEVICE_ID,
-                           te.SIGNAL_VELOCITY, te.SIGNAL_AMOUNT_ANOMALY,
-                           te.SIGNAL_GEO_MISMATCH, te.SIGNAL_WATCHLIST_MATCH,
-                           te.SIGNAL_STRUCTURING, te.SIGNAL_ROUND_NUMBER,
-                           te.RISK_SCORE AS TXN_SCORE, te.RISK_TIER AS TXN_TIER,
-                           a.KYC_STATUS, a.DOMICILE_COUNTRY, a.ACCOUNT_TYPE, a.ONBOARDING_DATE
-                    FROM FRAUDSHIELD_360_DB.AGENTS.FRAUD_ALERTS fa
-                    LEFT JOIN FRAUDSHIELD_360_DB.CURATED.TRANSACTION_ENRICHED te ON fa.TXN_ID = te.TXN_ID
-                    LEFT JOIN FRAUDSHIELD_360_DB.RAW.RAW_ACCOUNTS a ON fa.ACCOUNT_ID = a.ACCOUNT_ID
-                    WHERE fa.CASE_ID = ?
-                """, params=[report_case_id]).to_pandas()
+            with st.spinner("Sentinel AI is generating Suspicious Activity Report…"):
+                try:
+                    request_body = json.dumps({
+                        "messages": [{
+                            "role": "user",
+                            "content": [{
+                                "type": "text",
+                                "text": f"Generate a full SAR report for case {report_case_id}"
+                            }]
+                        }]
+                    })
 
-                verification_data = session.sql("""
-                    SELECT RESPONSE_TYPE, VERIFICATION_METHOD, RESPONSE_TIME_MINUTES,
-                           ALERT_DISPATCHED_AT, RESPONSE_TIMESTAMP
-                    FROM FRAUDSHIELD_360_DB.AGENTS.CUSTOMER_VERIFICATION_EVENTS
-                    WHERE CASE_ID = ?
-                    ORDER BY ALERT_DISPATCHED_AT DESC LIMIT 1
-                """, params=[report_case_id]).to_pandas()
+                    sar_df = session.sql("""
+                        SELECT SNOWFLAKE.CORTEX.DATA_AGENT_RUN(
+                            'FRAUDSHIELD_360_DB.AGENTS.SENTINEL_AI_ENGINE',
+                            ?,
+                            TRUE
+                        ) AS RESP
+                    """, params=[request_body]).to_pandas()
 
-                if not report_data.empty:
-                    rd = report_data.iloc[0]
-                    vr = verification_data.iloc[0] if not verification_data.empty else {}
+                    sar_df.columns = [c.upper() for c in sar_df.columns]
+                    resp_raw = sar_df["RESP"].iloc[0] if not sar_df.empty else None
+                    if resp_raw is not None:
+                        resp = json.loads(str(resp_raw))
+                        if isinstance(resp, str):
+                            resp = json.loads(resp)
+                        text_parts = [
+                            b["text"] for b in resp.get("content", [])
+                            if isinstance(b, dict) and b.get("type") == "text" and b.get("text")
+                        ]
+                        report_text = "\n\n".join(text_parts) if text_parts else None
+                    else:
+                        report_text = None
 
-                    # Build signals list
-                    fired_signals = []
-                    if rd.get("SIGNAL_VELOCITY"): fired_signals.append("VELOCITY (>3 txns/hour, weight=15)")
-                    if rd.get("SIGNAL_AMOUNT_ANOMALY"): fired_signals.append("AMOUNT_ANOMALY (>5x median, weight=25)")
-                    if rd.get("SIGNAL_GEO_MISMATCH"): fired_signals.append("GEO_MISMATCH (country != domicile, weight=20)")
-                    if rd.get("SIGNAL_WATCHLIST_MATCH"): fired_signals.append("WATCHLIST_MATCH (entity hit, weight=30)")
-                    if rd.get("SIGNAL_STRUCTURING"): fired_signals.append("STRUCTURING ($9K-$9.9K range, weight=20)")
-                    if rd.get("SIGNAL_ROUND_NUMBER"): fired_signals.append("ROUND_NUMBER (mod 1000=0, weight=5)")
-                    signals_str = "\n".join([f"  - {s}" for s in fired_signals]) if fired_signals else "  - None"
+                    if report_text:
+                        st.session_state["sar_report"] = {
+                            "case_id": str(report_case_id),
+                            "text": report_text,
+                        }
+                    else:
+                        st.session_state.pop("sar_report", None)
+                        st.error("Agent did not return a report. Please try again.")
 
-                    response_type = safe_val(vr.get("RESPONSE_TYPE") if isinstance(vr, dict) or hasattr(vr, 'get') else (vr["RESPONSE_TYPE"] if not verification_data.empty else None), "NO_VERIFICATION")
-
-                    amount = rd.get("AMOUNT")
-                    amount_str = f"${amount:,.2f}" if pd.notna(amount) else "N/A"
-
-                    report_text = f"""=== SUSPICIOUS ACTIVITY REPORT ===
-Case ID: {rd['CASE_ID']}
-Generated: Preview Mode
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 1: EXECUTIVE SUMMARY
-  Alert Type: {safe_val(rd.get('ALERT_TYPE'))}
-  Risk Tier: {safe_val(rd.get('TXN_TIER', rd.get('RISK_TIER')))} (Score: {safe_val(rd.get('TXN_SCORE', rd.get('RISK_SCORE')))}/100)
-  Account: {rd.get('ACCOUNT_ID')}
-  Amount: {amount_str}
-  Recommendation: {'SAR filing required' if safe_val(rd.get('TXN_TIER', rd.get('RISK_TIER'))) in ('CRITICAL', 'HIGH') else 'Continue monitoring'}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 2: SUBJECT IDENTIFICATION
-  Account ID: {rd.get('ACCOUNT_ID')}
-  Account Type: {safe_val(rd.get('ACCOUNT_TYPE'))}
-  Domicile: {safe_val(rd.get('DOMICILE_COUNTRY'))}
-  Onboarding: {safe_val(rd.get('ONBOARDING_DATE'))}
-  KYC Status: {safe_val(rd.get('KYC_STATUS'))}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 3: TRANSACTION DETAILS
-  TXN ID: {safe_val(rd.get('TXN_ID'))}
-  Amount: {amount_str}
-  Merchant: {safe_val(rd.get('MERCHANT'))}
-  Location: {safe_val(rd.get('GEO_CITY'))}, {safe_val(rd.get('GEO_COUNTRY'))}
-  Channel: {safe_val(rd.get('CHANNEL'))}
-  Timestamp: {safe_ts(rd.get('TXN_TIMESTAMP'))}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 4: EVIDENCE CHAIN
-  Triggered Signals:
-{signals_str}
-
-  Customer Verification:
-  - Status: {response_type}
-  - Method: {safe_val(vr.get('VERIFICATION_METHOD') if isinstance(vr, (dict, pd.Series)) else None)}
-  - Response Time: {safe_val(vr.get('RESPONSE_TIME_MINUTES') if isinstance(vr, (dict, pd.Series)) else None)} min
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 5: RISK ASSESSMENT
-  Composite Score: {safe_val(rd.get('TXN_SCORE', rd.get('RISK_SCORE')))}/100
-  Tier: {safe_val(rd.get('TXN_TIER', rd.get('RISK_TIER')))}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 6: PATTERN ANALYSIS
-  Analyst: {safe_val(rd.get('ASSIGNED_ANALYST'), 'Unassigned')}
-  Case Status: {rd.get('CASE_STATUS')}
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 7: REGULATORY IMPLICATIONS
-  {'- Amount >= $10K: CTR threshold (31 CFR 1010.311)' if pd.notna(amount) and amount >= 10000 else ''}
-  {'- Structuring suspected (31 USC 5324)' if rd.get('SIGNAL_STRUCTURING') else ''}
-  {'- Cross-border EDD required (FATF Rec. 16)' if rd.get('SIGNAL_GEO_MISMATCH') else ''}
-  {'- OFAC match: immediate escalation (31 CFR Part 501)' if rd.get('SIGNAL_WATCHLIST_MATCH') else ''}
-  - SAR filing recommended within 30 days (31 CFR 1020.320)
-
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-
-SECTION 8: RECOMMENDED ACTIONS
-  1. Escalate to BSA Officer
-  2. Place account on enhanced monitoring (90 days)
-  3. Prepare SAR filing within 30 calendar days
-  {'4. PRIORITY: Customer rejected transaction - initiate credential reset' if response_type == 'USER_REJECTED' else ''}
-
-=== END OF REPORT ==="""
-
-                    # Persist so the preview + downloads survive the download rerun
-                    st.session_state["sar_report"] = {
-                        "case_id": str(rd["CASE_ID"]),
-                        "text": report_text,
-                    }
-                else:
+                except Exception as e:
+                    print(f"[SAR_AGENT_ERROR] {e}")
                     st.session_state.pop("sar_report", None)
-                    st.error("Unable to retrieve case data. Please try a different case.")
+                    st.error(f"Failed to generate report: {str(e)[:300]}")
 
         # ---- Persisted preview + download options ----
         sar = st.session_state.get("sar_report")
@@ -1887,93 +1882,92 @@ elif screen == "Access Management":
             new_display = st.text_input("Display Name", placeholder="e.g., John Smith")
             new_email = st.text_input("Email", placeholder="user@company.com")
             new_role = st.selectbox("Initial Role", ASSIGNABLE_ROLES)
+            confirm_create = st.checkbox("I confirm this user should be created with the specified role.")
             add_submitted = st.form_submit_button("Create User")
 
         if add_submitted:
-            try:
-                _validate_identifier(new_login)
-                new_login = new_login.upper()  # Normalize to uppercase for CURRENT_USER() matching
-                _validate_identifier(new_role)
-                if not new_email or "@" not in new_email:
-                    raise ValueError("Invalid email address")
-                # Validate display name (allow spaces and common chars)
-                if new_display and not _re.match(r'^[A-Za-z0-9 _.\-]{1,255}$', new_display):
-                    raise ValueError("Display name contains invalid characters")
-
-                safe_display = new_display.replace("'", "''") if new_display else new_login
-                safe_email = new_email.replace("'", "''")
-
-                # Create user with warehouse + role
-                session.sql(f"""
-                    CREATE USER IF NOT EXISTS "{new_login}"
-                    PASSWORD = 'FraudShield360!Welcome2026'
-                    MUST_CHANGE_PASSWORD = TRUE
-                    DEFAULT_ROLE = '{new_role}'
-                    DEFAULT_WAREHOUSE = 'COMPUTE_WH'
-                    DISPLAY_NAME = '{safe_display}'
-                    EMAIL = '{safe_email}'
-                """).collect()
-                session.sql(f'GRANT ROLE {new_role} TO USER "{new_login}"').collect()
-                session.sql(f'GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE {new_role}').collect()
-                session.sql("""
-                    MERGE INTO FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING tgt
-                    USING (SELECT ? AS UN, ? AS AR) src
-                    ON tgt.USER_NAME = src.UN AND tgt.ASSIGNED_ROLE = src.AR
-                    WHEN MATCHED THEN UPDATE SET STATUS = 'ACTIVE', ASSIGNED_BY = CURRENT_USER(), ASSIGNED_AT = CURRENT_TIMESTAMP()
-                    WHEN NOT MATCHED THEN INSERT (USER_NAME, ASSIGNED_ROLE, ASSIGNED_BY, STATUS)
-                        VALUES (src.UN, src.AR, CURRENT_USER(), 'ACTIVE')
-                """, params=[new_login, new_role]).collect()
-                session.sql("""
-                    INSERT INTO FRAUDSHIELD_360_DB.AGENTS.AGENT_AUDIT_LOG
-                    (CASE_ID, ACTION_TAKEN, RESOLVED_BY, REVIEWER_NOTES)
-                    VALUES ('SYSTEM', 'USER_CREATED', CURRENT_USER(), ?)
-                """, params=[f"Created user {new_login} with role {new_role}"]).collect()
-
-                # Send welcome email with credentials
-                acct_url = "https://app.snowflake.com"
-                welcome_msg = (
-                    f"Welcome to FraudShield 360!\n\n"
-                    f"Your account has been created.\n\n"
-                    f"Login Name: {new_login}\n"
-                    f"Temporary Password: FraudShield360!Welcome2026\n"
-                    f"Role: {new_role}\n\n"
-                    f"Login URL: {acct_url}\n"
-                    f"Organization: APLFNWV\n"
-                    f"Account: TV48944\n\n"
-                    f"You will be required to change your password on first login.\n"
-                    f"After login, open the FraudShield Command Center app from Streamlit.\n\n"
-                    f"— FraudShield 360 Admin"
-                )
-                email_sent = False
+            if not confirm_create:
+                st.error("You must confirm the user creation before proceeding.")
+            else:
                 try:
+                    _validate_identifier(new_login)
+                    new_login = new_login.upper()
+                    _validate_identifier(new_role)
+                    if not new_email or "@" not in new_email:
+                        raise ValueError("Invalid email address")
+                    if new_display and not _re.match(r'^[A-Za-z0-9 _.\-]{1,255}$', new_display):
+                        raise ValueError("Display name contains invalid characters")
+
+                    safe_display = new_display.replace("'", "''") if new_display else new_login
+                    safe_email = new_email.replace("'", "''")
+
+                    session.sql(f"""
+                        CREATE USER IF NOT EXISTS "{new_login}"
+                        PASSWORD = 'FraudShield360!Welcome2026'
+                        MUST_CHANGE_PASSWORD = TRUE
+                        DEFAULT_ROLE = '{new_role}'
+                        DEFAULT_WAREHOUSE = 'COMPUTE_WH'
+                        DISPLAY_NAME = '{safe_display}'
+                        EMAIL = '{safe_email}'
+                    """).collect()
+                    session.sql(f'GRANT ROLE {new_role} TO USER "{new_login}"').collect()
+                    session.sql(f'GRANT USAGE ON WAREHOUSE COMPUTE_WH TO ROLE {new_role}').collect()
                     session.sql("""
-                        CALL SYSTEM$SEND_EMAIL(
-                            'FRAUDSHIELD_EMAIL_INT',
-                            ?,
-                            'FraudShield 360: Your Account Has Been Created',
-                            ?
-                        )
-                    """, params=[new_email, welcome_msg]).collect()
-                    email_sent = True
-                except Exception as email_err:
-                    print(f"[WELCOME_EMAIL_ERROR] {email_err}")
+                        MERGE INTO FRAUDSHIELD_360_DB.AGENTS.USER_ROLE_MAPPING tgt
+                        USING (SELECT ? AS UN, ? AS AR) src
+                        ON tgt.USER_NAME = src.UN AND tgt.ASSIGNED_ROLE = src.AR
+                        WHEN MATCHED THEN UPDATE SET STATUS = 'ACTIVE', ASSIGNED_BY = CURRENT_USER(), ASSIGNED_AT = CURRENT_TIMESTAMP()
+                        WHEN NOT MATCHED THEN INSERT (USER_NAME, ASSIGNED_ROLE, ASSIGNED_BY, STATUS)
+                            VALUES (src.UN, src.AR, CURRENT_USER(), 'ACTIVE')
+                    """, params=[new_login, new_role]).collect()
+                    session.sql("""
+                        INSERT INTO FRAUDSHIELD_360_DB.AGENTS.AGENT_AUDIT_LOG
+                        (CASE_ID, ACTION_TAKEN, RESOLVED_BY, REVIEWER_NOTES)
+                        VALUES ('SYSTEM', 'USER_CREATED', CURRENT_USER(), ?)
+                    """, params=[f"Created user {new_login} with role {new_role}"]).collect()
 
-                if email_sent:
-                    st.success(f"User **{new_login}** created. Welcome email sent to **{new_email}**.")
-                else:
-                    st.success(f"User **{new_login}** created with role **{new_role}**.")
-                    st.warning(f"Email to **{new_email}** failed — address is not in the notification integration's allowed list.")
+                    acct_url = "https://app.snowflake.com"
+                    welcome_msg = (
+                        f"Welcome to FraudShield 360!\n\n"
+                        f"Your account has been created.\n\n"
+                        f"Login Name: {new_login}\n"
+                        f"Temporary Password: FraudShield360!Welcome2026\n"
+                        f"Role: {new_role}\n\n"
+                        f"Login URL: {acct_url}\n"
+                        f"Organization: APLFNWV\n"
+                        f"Account: TV48944\n\n"
+                        f"You will be required to change your password on first login.\n"
+                        f"After login, open the FraudShield Command Center app from Streamlit.\n\n"
+                        f"— FraudShield 360 Admin"
+                    )
+                    email_sent = False
+                    try:
+                        session.sql("""
+                            CALL SYSTEM$SEND_EMAIL(
+                                'FRAUDSHIELD_EMAIL_INT',
+                                ?,
+                                'FraudShield 360: Your Account Has Been Created',
+                                ?
+                            )
+                        """, params=[new_email, welcome_msg]).collect()
+                        email_sent = True
+                    except Exception as email_err:
+                        print(f"[WELCOME_EMAIL_ERROR] {email_err}")
 
-                    # Offer admin the option to add the email and retry
-                    st.session_state["_pending_welcome"] = {
-                        "email": new_email, "login": new_login, "role": new_role, "msg": welcome_msg
-                    }
-            except ValueError as ve:
-                print(f"[ADD_USER_VALIDATION] {ve}")
-                st.error(f"Validation error: {str(ve)}")
-            except Exception as e:
-                print(f"[ADD_USER_ERROR] {e}")
-                st.error(f"Failed to create user: {str(e)}")
+                    if email_sent:
+                        st.success(f"User **{new_login}** created. Welcome email sent to **{new_email}**.")
+                    else:
+                        st.success(f"User **{new_login}** created with role **{new_role}**.")
+                        st.warning(f"Email to **{new_email}** failed — address is not in the notification integration's allowed list.")
+                        st.session_state["_pending_welcome"] = {
+                            "email": new_email, "login": new_login, "role": new_role, "msg": welcome_msg
+                        }
+                except ValueError as ve:
+                    print(f"[ADD_USER_VALIDATION] {ve}")
+                    st.error(f"Validation error: {str(ve)}")
+                except Exception as e:
+                    print(f"[ADD_USER_ERROR] {e}")
+                    st.error(f"Failed to create user: {str(e)}")
 
         # Pending welcome email — admin can approve adding the email and retry
         pending = st.session_state.get("_pending_welcome")
