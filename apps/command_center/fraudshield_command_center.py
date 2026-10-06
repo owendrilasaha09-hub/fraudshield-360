@@ -1170,8 +1170,8 @@ elif screen == "Case Investigator":
             st.divider()
             st.subheader("Case Resolution Panel")
 
-            current_status = cd.get("CASE_STATUS", "OPEN")
-            current_version = cd.get("ROW_VERSION", 1) or 1
+            current_status = str(cd.get("CASE_STATUS", "OPEN"))
+            current_version = int(cd.get("ROW_VERSION", 1) or 1)
             case_risk_score = int(safe_val(cd.get("TXN_RISK_SCORE", cd.get("RISK_SCORE", 0)), 0))
             case_risk_tier = str(safe_val(cd.get("TXN_RISK_TIER", cd.get("RISK_TIER", ""))))
 
@@ -1334,7 +1334,7 @@ elif screen == "Case Investigator":
                                     session.sql("""
                                         CALL SYSTEM$SEND_EMAIL(
                                             'FRAUDSHIELD_EMAIL_INT',
-                                            'owendrilasaha09@gmail.com',
+'mrbiswambhar2001@gmail.com',
                                             'FraudShield Alert: Case Escalated',
                                             ?
                                         )
@@ -1371,7 +1371,7 @@ elif screen == "Case Investigator":
 
                         except Exception as e:
                             print(f"[STATE_MACHINE_ERROR] case={selected_case_id} edge={current_status}->{to_status} error={e}")
-                            st.error("An error occurred during case transition. Please try again.")
+                            st.error(f"Case transition error: {e}")
 
 
 # =============================================================================
